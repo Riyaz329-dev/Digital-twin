@@ -401,11 +401,18 @@ def page_patient_twin(df, model, feature_cols, threshold):
         "Missed medication", "Stress/illness"
     ], index=0)
 
-    anchor_time = None
-    if start_choice == "System now":
-        anchor_time = pd.Timestamp.now().floor("min")
-    elif start_choice == "Custom…":
-        anchor_time = pd.Timestamp(st.datetime_input("Pick start time", value=pd.Timestamp.now().floor("min"), key="fc_dt"))
+    from datetime import datetime as _dt
+
+anchor_time = None
+if start_choice == "System now":
+    anchor_time = pd.Timestamp.now().floor("min")
+elif start_choice == "Custom…":
+    d_default = pd.Timestamp.now().date()
+    t_default = pd.Timestamp.now().floor("min").time()
+    d = st.date_input("Pick start date", value=d_default, key="fc_date")
+    t = st.time_input("Pick start time", value=t_default, key="fc_time")
+    anchor_time = pd.Timestamp(_dt.combine(d, t))
+
 
     if st.button("Generate forecast"):
         fut = simulate_future(pid, df, model, feature_cols, threshold,
