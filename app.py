@@ -8,7 +8,7 @@
 #  - Collected_cleaned.csv
 #
 # Run:
-#   pip install streamlit pandas plotly scikit-learn xgboost joblib
+#   pip install streamlit pandas plotly scikit-learn xgboost joblib statsmodels
 #   streamlit run app.py
 
 import os
@@ -25,6 +25,13 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
     f1_score, roc_auc_score, confusion_matrix
 )
+
+# Optional: ARIMA for forecasting (we'll fallback if unavailable)
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+    _ARIMA_OK = True
+except Exception:
+    _ARIMA_OK = False
 
 # ---------- GLOBAL CONFIG ----------
 st.set_page_config(
@@ -44,16 +51,21 @@ def load_model_artifacts():
 @st.cache_data
 def load_collected() -> pd.DataFrame:
     df = pd.read_csv("Collected_cleaned.csv")
+    # expected minimal columns: patient_id, timestamp, blood_glucose_level, HbA1c_level
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     else:
         raise ValueError("Collected_cleaned.csv must contain a 'timestamp' column.")
+    if "patient_id" not in df.columns:
+        raise ValueError("Collected_cleaned.csv must contain 'patient_id'.")
+    if "blood_glucose_level" not in df.columns or "HbA1c_level" not in df.columns:
+        raise ValueError("Collected_cleaned.csv must contain 'blood_glucose_level' and 'HbA1c_level'.")
+
+    # Shift dataset history to 'today' for live-ish replay feel
     start_date_hist = df["timestamp"].dt.normalize().min()
     today_norm = pd.Timestamp.now().normalize()
     delta_to_today = today_norm - start_date_hist
     df["shifted_ts"] = df["timestamp"] + delta_to_today
-    if "patient_id" not in df.columns:
-        raise ValueError("Collected_cleaned.csv must contain 'patient_id'.")
     return df.sort_values(["patient_id", "shifted_ts"]).reset_index(drop=True)
 
 def get_patient_list(df: pd.DataFrame):
@@ -74,7 +86,7 @@ def predict_row(model, feature_cols, row: pd.Series) -> float:
 
 def compute_kpis(g: pd.DataFrame, threshold: float):
     tir = None
-    if not g.empty:
+    if not g.empty and "blood_glucose_level" in g:
         tir = float((g["blood_glucose_level"] < 180).mean() * 100.0)
     alerts = int((g.get("proba", pd.Series([])) >= threshold).sum()) if "proba" in g else 0
     mean_glucose = float(g["blood_glucose_level"].mean()) if not g.empty else np.nan
@@ -167,6 +179,7 @@ def build_patient_series(df: pd.DataFrame, pid: str) -> pd.DataFrame:
     )
 
 def ewma_forecast(series: pd.Series, steps: int, alpha: float = 0.5, noise_std: float = 3.0) -> np.ndarray:
+    """Simple, stable smoother that respects recent values more."""
     if len(series) == 0:
         return np.array([])
     level = series.iloc[-1]
@@ -178,37 +191,87 @@ def ewma_forecast(series: pd.Series, steps: int, alpha: float = 0.5, noise_std: 
         preds.append(max(current, 0))
     return np.array(preds)
 
-def apply_scenario(glucose_arr: np.ndarray, scenario: str) -> np.ndarray:
-    factors = {
-        "Maintain (no change)": 1.00,
-        "Improve (diet/med −10%)": 0.90,
-        "Strong improve (−20%)": 0.80,
-        "Worsen (+10%)": 1.10,
-    }
-    f = factors.get(scenario, 1.00)
-    return np.clip(glucose_arr * f, 0, None)
+def arima_forecast(series: pd.Series, steps: int) -> np.ndarray:
+    """ARIMA(1,1,1) forecast; falls back to EWMA if statsmodels not available or fit fails."""
+    if not _ARIMA_OK or len(series) < 10:
+        return ewma_forecast(series, steps=steps, alpha=0.5, noise_std=3.0)
+    try:
+        # differencing handled by d=1
+        model = ARIMA(series.astype(float), order=(1,1,1), enforce_stationarity=False, enforce_invertibility=False)
+        res = model.fit(method_kwargs={"warn_convergence": False})
+        fc = res.forecast(steps=steps).values
+        return np.clip(fc, 0, None)
+    except Exception:
+        return ewma_forecast(series, steps=steps, alpha=0.5, noise_std=3.0)
+
+def apply_scenario(glucose_arr: np.ndarray, scenario: str, freq_minutes: int) -> np.ndarray:
+    """Apply scenario effects: multiplicative (activity) or additive bumps (meals/med)."""
+    g = glucose_arr.copy()
+
+    if scenario == "Maintain (no change)":
+        return g
+
+    # helper shapes
+    n = len(g)
+    t = np.arange(n)
+
+    if scenario == "Increase activity (+20 min)":
+        # gradual 5–10% reduction over horizon
+        factor = np.linspace(1.0, 0.92, n)
+        return np.clip(g * factor, 0, None)
+
+    if scenario == "High-carb meal (+30g)":
+        # transient bump: gaussian peak around first 1–2 hours, then decay
+        # 30g carbs ~ +30–50 mg/dL peak (toy model)
+        peak = 40.0
+        sigma = max(1, int(60/freq_minutes))  # peak width roughly 1 hour
+        center = max(0, int(60/freq_minutes)) # center near 1h
+        bump = peak * np.exp(-0.5*((t-center)/sigma)**2)
+        return np.clip(g + bump, 0, None)
+
+    if scenario == "Missed medication":
+        # sustained upward drift (~ +15 mg/dL across horizon)
+        drift = np.linspace(0, 15, n)
+        return np.clip(g + drift, 0, None)
+
+    if scenario == "Stress/illness":
+        # modest sustained increase (~ +10 mg/dL)
+        return np.clip(g + 10.0, 0, None)
+
+    return g
 
 def simulate_future(pid: str, df_src: pd.DataFrame, model, feature_cols: list, threshold: float,
                     horizon_hours: int = 24, freq_minutes: int = 60, method: str = "EWMA",
                     scenario: str = "Maintain (no change)") -> pd.DataFrame:
+    """Produce future rows with predicted glucose + risk using model, under chosen scenario."""
     hist = build_patient_series(df_src, pid)
     if hist.empty:
         return pd.DataFrame()
+
     last_time = hist["ts"].max()
+    steps = max(1, int(horizon_hours*60/freq_minutes))
     future_index = pd.date_range(
         start=last_time + pd.Timedelta(minutes=freq_minutes),
-        periods=max(1, int(horizon_hours*60/freq_minutes)),
+        periods=steps,
         freq=f"{freq_minutes}min"
     )
+
+    # --- Base glucose forecast ---
     if method == "Hold-Last":
-        base = np.full(len(future_index), hist["glucose"].iloc[-1])
-        noise = np.random.normal(0, 2.0, size=len(base))
-        g_fore = np.clip(base + noise, 0, None)
-    else:
-        g_fore = ewma_forecast(hist["glucose"], steps=len(future_index), alpha=0.5, noise_std=3.0)
-    g_fore = apply_scenario(g_fore, scenario)
-    hba1c_last = float(hist["hba1c"].iloc[-1])
-    h_fore = np.full(len(future_index), hba1c_last)
+        base = np.full(steps, float(hist["glucose"].iloc[-1]))
+        base = np.clip(base + np.random.normal(0, 2.0, size=steps), 0, None)
+    elif method == "ARIMA":
+        base = arima_forecast(hist["glucose"], steps=steps)
+    else:  # EWMA
+        base = ewma_forecast(hist["glucose"], steps=steps, alpha=0.5, noise_std=3.0)
+
+    # --- Apply scenario dynamics ---
+    g_fore = apply_scenario(base, scenario, freq_minutes=freq_minutes)
+
+    # HbA1c assumed stable short-term
+    h_fore = np.full(steps, float(hist["hba1c"].iloc[-1]))
+
+    # Build future DF and score risk with the model
     last_row = df_src[df_src["patient_id"].astype(str) == str(pid)].sort_values("shifted_ts").iloc[-1].copy()
     fut = pd.DataFrame({
         "patient_id": pid,
@@ -217,10 +280,12 @@ def simulate_future(pid: str, df_src: pd.DataFrame, model, feature_cols: list, t
         "HbA1c_level": h_fore,
         "blood_glucose_level": g_fore
     })
+    # Ensure model features present
     for col in feature_cols:
         if col in ["HbA1c_level", "blood_glucose_level"]:
             continue
         fut[col] = last_row.get(col, 0)
+
     X = fut[feature_cols].copy()
     proba = model.predict_proba(X)[:, 1]
     fut["proba"] = proba
@@ -399,12 +464,13 @@ def page_patient_twin(df, model, feature_cols, threshold):
     col_fs1, col_fs2, col_fs3, col_fs4 = st.columns(4)
     horizon = col_fs1.slider("Horizon (hours)", 1, 72, 24, 1)
     freq = col_fs2.selectbox("Frequency", [15, 30, 60, 120], index=2, format_func=lambda m: f"{m} min")
-    method = col_fs3.selectbox("Method", ["EWMA", "Hold-Last"], index=0)
+    method = col_fs3.selectbox("Method", ["EWMA", "ARIMA", "Hold-Last"], index=0)
     scenario = col_fs4.selectbox("Scenario", [
         "Maintain (no change)",
-        "Improve (diet/med −10%)",
-        "Strong improve (−20%)",
-        "Worsen (+10%)",
+        "Increase activity (+20 min)",
+        "High-carb meal (+30g)",
+        "Missed medication",
+        "Stress/illness",
     ], index=0)
 
     if st.button("Generate forecast"):
@@ -414,15 +480,13 @@ def page_patient_twin(df, model, feature_cols, threshold):
         if fut.empty:
             st.info("No history for this patient to forecast from.")
         else:
-            # Small future table
-            st.dataframe(
-                fut[["shifted_ts","blood_glucose_level","HbA1c_level","proba","status","advice"]]
-                .rename(columns={"shifted_ts":"time","blood_glucose_level":"glucose","HbA1c_level":"hba1c"})
-                .head(20),
-                use_container_width=True, hide_index=True
-            )
+            # Small future table + download
+            show_cols = ["shifted_ts","blood_glucose_level","HbA1c_level","proba","status","advice"]
+            preview = fut[show_cols].rename(columns={"shifted_ts":"time","blood_glucose_level":"glucose","HbA1c_level":"hba1c"})
+            st.dataframe(preview.head(20), use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Download forecast CSV", data=preview.to_csv(index=False), file_name=f"forecast_{pid}.csv", mime="text/csv")
 
-            # Overlay forecast on the chart
+            # Overlay forecast on glucose chart
             base = g.copy()
             base["is_forecast"] = False
             plot_df = pd.concat([base, fut], ignore_index=True)
@@ -439,7 +503,7 @@ def page_patient_twin(df, model, feature_cols, threshold):
             if not fut_df.empty:
                 fig.add_trace(go.Scatter(
                     x=fut_df["shifted_ts"], y=fut_df["blood_glucose_level"],
-                    mode="lines+markers", name="Forecast",
+                    mode="lines+markers", name=f"Forecast ({method}, {scenario})",
                     line=dict(width=2, dash="dash"), marker=dict(size=7)
                 ))
             fig.add_hrect(y0=70, y1=180, fillcolor="rgba(0,200,0,0.05)", line_width=0)
@@ -450,8 +514,21 @@ def page_patient_twin(df, model, feature_cols, threshold):
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # Forecast alerts
+            # NEW: Risk curve over forecast horizon
+            risk_fig = go.Figure()
+            risk_fig.add_trace(go.Scatter(
+                x=fut["shifted_ts"], y=fut["proba"], mode="lines+markers", name="Predicted risk P(diabetes)"
+            ))
+            risk_fig.add_hline(y=threshold, line_dash="dash", line_color="red", annotation_text=f"threshold={threshold:.2f}")
+            risk_fig.update_layout(title="Forecasted Risk Probability", xaxis_title="Time", yaxis_title="Probability", height=320)
+            st.plotly_chart(risk_fig, use_container_width=True)
+
+            # Forecast alerts summary
             alerts_fut = fut[fut["proba"] >= threshold][["shifted_ts","blood_glucose_level","HbA1c_level","proba","status","advice"]]
+            cA, cB, cC = st.columns(3)
+            cA.metric("Forecast points", f"{len(fut)}")
+            cB.metric("Forecasted alerts", f"{len(alerts_fut)}")
+            cC.metric("Max forecast prob", f"{fut['proba'].max():.2f}")
             if alerts_fut.empty:
                 st.success("No forecasted alerts in the selected horizon.")
             else:
