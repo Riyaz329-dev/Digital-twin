@@ -159,6 +159,77 @@ def clock_panel(selected_pid: str | None, df: pd.DataFrame, title: str = "⏱️
     c2.metric(f"Simulated Time (dataset) — Patient {selected_pid if selected_pid else ''}", sim_label)
     st.caption("System Clock = real local time • Simulated Time = dataset timestamp being replayed.")
 
+# ---------- FORECAST HELPERS ----------
+def build_patient_series(df: pd.DataFrame, pid: str) -> pd.DataFrame:
+    g = df[df["patient_id"].astype(str) == str(pid)].sort_values("shifted_ts").copy()
+    return g[["shifted_ts", "blood_glucose_level", "HbA1c_level"]].rename(
+        columns={"shifted_ts":"ts", "blood_glucose_level":"glucose", "HbA1c_level":"hba1c"}
+    )
+
+def ewma_forecast(series: pd.Series, steps: int, alpha: float = 0.5, noise_std: float = 3.0) -> np.ndarray:
+    if len(series) == 0:
+        return np.array([])
+    level = series.iloc[-1]
+    ew = series.ewm(alpha=alpha).mean().iloc[-1]
+    preds = []
+    current = level
+    for _ in range(steps):
+        current = 0.6*current + 0.4*ew + np.random.normal(0, noise_std)
+        preds.append(max(current, 0))
+    return np.array(preds)
+
+def apply_scenario(glucose_arr: np.ndarray, scenario: str) -> np.ndarray:
+    factors = {
+        "Maintain (no change)": 1.00,
+        "Improve (diet/med −10%)": 0.90,
+        "Strong improve (−20%)": 0.80,
+        "Worsen (+10%)": 1.10,
+    }
+    f = factors.get(scenario, 1.00)
+    return np.clip(glucose_arr * f, 0, None)
+
+def simulate_future(pid: str, df_src: pd.DataFrame, model, feature_cols: list, threshold: float,
+                    horizon_hours: int = 24, freq_minutes: int = 60, method: str = "EWMA",
+                    scenario: str = "Maintain (no change)") -> pd.DataFrame:
+    hist = build_patient_series(df_src, pid)
+    if hist.empty:
+        return pd.DataFrame()
+    last_time = hist["ts"].max()
+    future_index = pd.date_range(
+        start=last_time + pd.Timedelta(minutes=freq_minutes),
+        periods=max(1, int(horizon_hours*60/freq_minutes)),
+        freq=f"{freq_minutes}min"
+    )
+    if method == "Hold-Last":
+        base = np.full(len(future_index), hist["glucose"].iloc[-1])
+        noise = np.random.normal(0, 2.0, size=len(base))
+        g_fore = np.clip(base + noise, 0, None)
+    else:
+        g_fore = ewma_forecast(hist["glucose"], steps=len(future_index), alpha=0.5, noise_std=3.0)
+    g_fore = apply_scenario(g_fore, scenario)
+    hba1c_last = float(hist["hba1c"].iloc[-1])
+    h_fore = np.full(len(future_index), hba1c_last)
+    last_row = df_src[df_src["patient_id"].astype(str) == str(pid)].sort_values("shifted_ts").iloc[-1].copy()
+    fut = pd.DataFrame({
+        "patient_id": pid,
+        "timestamp": future_index,
+        "shifted_ts": future_index,
+        "HbA1c_level": h_fore,
+        "blood_glucose_level": g_fore
+    })
+    for col in feature_cols:
+        if col in ["HbA1c_level", "blood_glucose_level"]:
+            continue
+        fut[col] = last_row.get(col, 0)
+    X = fut[feature_cols].copy()
+    proba = model.predict_proba(X)[:, 1]
+    fut["proba"] = proba
+    fut["pred"] = (proba >= threshold).astype(int)
+    fut["status"] = np.where(fut["pred"] == 1, "DIABETIC", "NORMAL")
+    fut["advice"] = [advise(g, h) for g, h in zip(fut["blood_glucose_level"], fut["HbA1c_level"])]
+    fut["is_forecast"] = True
+    return fut
+
 # ---------- VISUALS ----------
 def plot_patient_trend(df_show: pd.DataFrame, threshold: float, title: str):
     if df_show.empty:
@@ -199,6 +270,8 @@ def cohort_tiles(df_log: pd.DataFrame, pids: list, threshold: float):
 def page_all_patients(df, model, feature_cols, threshold):
     st.markdown("## 🏥 All Patients — Command Center")
     pids = get_patient_list(df)
+
+    # Sidebar controls
     with st.sidebar:
         st.markdown("### ▶️ Stream Controls")
         autoplay = st.toggle("Auto-play stream (selected patient)", value=st.session_state.autoplay)
@@ -214,8 +287,10 @@ def page_all_patients(df, model, feature_cols, threshold):
             st.session_state.stream_index[target_pid] = 0
             st.session_state.log_df = st.session_state.log_df[st.session_state.log_df["patient_id"] != target_pid]
             st.rerun()
-    # Clock
+
+    # Clock panel
     clock_panel(target_pid, df, title="⏱️ Live vs Simulated Time")
+
     # Autoplay loop
     now = time.time()
     if st.session_state.autoplay and now - st.session_state.last_tick >= refresh:
@@ -223,26 +298,33 @@ def page_all_patients(df, model, feature_cols, threshold):
         st.session_state.last_tick = now
         if did:
             st.rerun()
+
     # Cohort
     st.markdown("#### Cohort Overview")
     log = st.session_state.log_df.copy()
     cohort_tiles(log, pids, threshold)
+
+    # Alerts
     st.markdown("#### Recent Alerts")
     if log.empty:
         st.info("No alerts yet. Start streaming.")
     else:
         alerts = log[log["proba"] >= threshold].sort_values("shown_ts", ascending=False).head(50)
-        st.dataframe(alerts[["patient_id","shown_ts","blood_glucose_level","HbA1c_level","proba","status","advice"]]
-                     .rename(columns={"blood_glucose_level":"glucose","HbA1c_level":"hba1c"}),
-                     use_container_width=True, hide_index=True)
+        st.dataframe(
+            alerts[["patient_id","shown_ts","blood_glucose_level","HbA1c_level","proba","status","advice"]]
+            .rename(columns={"blood_glucose_level":"glucose","HbA1c_level":"hba1c"}),
+            use_container_width=True, hide_index=True
+        )
 
 def page_patient_twin(df, model, feature_cols, threshold):
     st.markdown("## 👤 Patient Twin — Real-Time Cockpit")
+
     pids = get_patient_list(df)
     with st.sidebar:
         pid = st.selectbox("Patient", pids, index=0)
         init_patient_pointer(pid, df)
         st.markdown("---")
+        st.markdown("### ▶️ Live Stream")
         autoplay = st.toggle("Auto-play (this patient)", value=st.session_state.autoplay, key="autoplay_pt")
         st.session_state.autoplay = autoplay
         refresh = st.slider("Interval (seconds)", 0.5, 3.0, 1.0, 0.5, key="refresh_pt")
@@ -256,18 +338,25 @@ def page_patient_twin(df, model, feature_cols, threshold):
             st.rerun()
         st.markdown("---")
         st.markdown("### Threshold")
+        st.caption("Current decision threshold used for status.")
         st.info(f"Threshold: **{threshold:.3f}** (edit in *Model & Threshold* page)")
-    # Clock
+
+    # Clock panel
     clock_panel(pid, df, title="⏱️ Live vs Simulated Time")
-    # Autoplay
+
+    # Autoplay step
     now = time.time()
     if st.session_state.autoplay and now - st.session_state.last_tick >= refresh:
         did = advance_one_tick(pid, df, model, feature_cols, threshold)
         st.session_state.last_tick = now
         if did:
             st.rerun()
+
+    # Current log slice for patient
     log = st.session_state.log_df.copy()
     g = log[log["patient_id"].astype(str) == str(pid)].sort_values("shown_ts")
+
+    # Header cards: current twin state
     c1, c2, c3, c4 = st.columns(4)
     if g.empty:
         c1.metric("Latest Glucose", "—")
@@ -280,62 +369,162 @@ def page_patient_twin(df, model, feature_cols, threshold):
         c2.metric("Latest HbA1c", f"{float(last['HbA1c_level']):.2f}")
         c3.metric("Risk Probability", f"{float(last['proba']):.3f}")
         c4.metric("Status", last["status"], help=last["advice"])
-    plot_patient_trend(g, threshold, f"Patient {pid} — Glucose trend")
+
+    # Historical trend
+    plot_patient_trend(g, threshold, f"Patient {pid} — Glucose trend (green=NORMAL, red=DIABETIC)")
+
+    # KPIs + Advice + Events
     k1, k2, k3, k4 = st.columns(4)
     tir, alerts, mean_glucose, max_prob = compute_kpis(g, threshold)
-    k1.metric("Time-in-Range (70–180)%", f"{0 if tir is None else tir:.1f}%")
-    k2.metric("Alerts", f"{alerts}")
+    k1.metric("Time-in-Range (70–180) %", f"{0 if tir is None else tir:.1f}%")
+    k2.metric("Alerts in Window", f"{alerts}")
     k3.metric("Mean Glucose", "—" if np.isnan(mean_glucose) else f"{mean_glucose:.0f} mg/dL")
-    k4.metric("Max Prob", "—" if np.isnan(max_prob) else f"{max_prob:.2f}")
+    k4.metric("Max Probability", "—" if np.isnan(max_prob) else f"{max_prob:.2f}")
+
     st.markdown("#### Advice Feed")
     if g.empty:
         st.info("No events yet. Start streaming.")
     else:
         show = g[["shown_ts","blood_glucose_level","HbA1c_level","status","advice","proba"]].tail(10)
-        show = show.rename(columns={"shown_ts":"time","blood_glucose_level":"glucose","HbA1c_level":"hba1c"})
+        show = show.rename(columns={
+            "shown_ts":"time",
+            "blood_glucose_level":"glucose",
+            "HbA1c_level":"hba1c"
+        })
         st.dataframe(show, use_container_width=True, hide_index=True)
-    st.caption("⚠️ Educational prototype — not for medical use.")
+
+    # ---------- 🔮 FUTURE SIMULATOR ----------
+    st.markdown("---")
+    st.markdown("### 🔮 Future Simulator (Forecast)")
+    col_fs1, col_fs2, col_fs3, col_fs4 = st.columns(4)
+    horizon = col_fs1.slider("Horizon (hours)", 1, 72, 24, 1)
+    freq = col_fs2.selectbox("Frequency", [15, 30, 60, 120], index=2, format_func=lambda m: f"{m} min")
+    method = col_fs3.selectbox("Method", ["EWMA", "Hold-Last"], index=0)
+    scenario = col_fs4.selectbox("Scenario", [
+        "Maintain (no change)",
+        "Improve (diet/med −10%)",
+        "Strong improve (−20%)",
+        "Worsen (+10%)",
+    ], index=0)
+
+    if st.button("Generate forecast"):
+        fut = simulate_future(pid, df, model, feature_cols, threshold,
+                              horizon_hours=horizon, freq_minutes=freq,
+                              method=method, scenario=scenario)
+        if fut.empty:
+            st.info("No history for this patient to forecast from.")
+        else:
+            # Small future table
+            st.dataframe(
+                fut[["shifted_ts","blood_glucose_level","HbA1c_level","proba","status","advice"]]
+                .rename(columns={"shifted_ts":"time","blood_glucose_level":"glucose","HbA1c_level":"hba1c"})
+                .head(20),
+                use_container_width=True, hide_index=True
+            )
+
+            # Overlay forecast on the chart
+            base = g.copy()
+            base["is_forecast"] = False
+            plot_df = pd.concat([base, fut], ignore_index=True)
+
+            fig = go.Figure()
+            hist_df = plot_df[plot_df["is_forecast"] == False]
+            if not hist_df.empty:
+                fig.add_trace(go.Scatter(
+                    x=hist_df["shown_ts"], y=hist_df["blood_glucose_level"],
+                    mode="lines+markers", name="Historical",
+                    line=dict(width=2), marker=dict(size=7, line=dict(width=1, color="black"))
+                ))
+            fut_df = plot_df[plot_df["is_forecast"] == True]
+            if not fut_df.empty:
+                fig.add_trace(go.Scatter(
+                    x=fut_df["shifted_ts"], y=fut_df["blood_glucose_level"],
+                    mode="lines+markers", name="Forecast",
+                    line=dict(width=2, dash="dash"), marker=dict(size=7)
+                ))
+            fig.add_hrect(y0=70, y1=180, fillcolor="rgba(0,200,0,0.05)", line_width=0)
+            fig.add_hline(y=180, line_dash="dash", line_color="orange", annotation_text="180 mg/dL")
+            fig.update_layout(
+                title=f"Patient {pid} — Historical vs Forecasted Glucose",
+                xaxis_title="Time", yaxis_title="Blood Glucose (mg/dL)", height=420
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Forecast alerts
+            alerts_fut = fut[fut["proba"] >= threshold][["shifted_ts","blood_glucose_level","HbA1c_level","proba","status","advice"]]
+            if alerts_fut.empty:
+                st.success("No forecasted alerts in the selected horizon.")
+            else:
+                st.warning(f"{len(alerts_fut)} forecasted alert(s) in the selected horizon.")
+                st.dataframe(
+                    alerts_fut.rename(columns={"shifted_ts":"time","blood_glucose_level":"glucose","HbA1c_level":"hba1c"}),
+                    use_container_width=True, hide_index=True
+                )
+
+    st.caption("⚠️ Educational prototype — not for medical use. Forecasts are scenario simulations.")
 
 def page_model_threshold(df, model, feature_cols, threshold):
     st.markdown("## 🧠 Model & Threshold — Twin Brain")
+
+    st.markdown("### Global Feature Importance")
     try:
         importances = getattr(model, "feature_importances_", None)
         if importances is not None:
             fi = pd.DataFrame({"feature": feature_cols, "importance": importances}).sort_values("importance", ascending=False).head(15)
             st.plotly_chart(px.bar(fi, x="importance", y="feature", orientation="h", title="Top Features"), use_container_width=True)
+        else:
+            st.info("Model does not expose `feature_importances_`.")
     except Exception as e:
         st.warning(f"Feature importances unavailable: {e}")
-    st.markdown("### Threshold Tuning — Preview")
+
+    st.markdown("### Threshold Tuning — Preview on Collected Data")
     new_thr = st.slider("Threshold", 0.05, 0.95, float(threshold), 0.01)
+
     try:
         df_eval = df.dropna(subset=feature_cols + ["diabetes"]).copy()
         X_eval, y_eval = df_eval[feature_cols], df_eval["diabetes"].astype(int)
         proba_eval = model.predict_proba(X_eval)[:, 1]
         y_pred_eval = (proba_eval >= new_thr).astype(int)
-        acc = accuracy_score(y_eval, y_pred_eval); prec = precision_score(y_eval, y_pred_eval, zero_division=0)
-        rec = recall_score(y_eval, y_pred_eval, zero_division=0); f1 = f1_score(y_eval, y_pred_eval, zero_division=0)
-        auc = roc_auc_score(y_eval, proba_eval)
+
+        acc  = accuracy_score(y_eval, y_pred_eval)
+        prec = precision_score(y_eval, y_pred_eval, zero_division=0)
+        rec  = recall_score(y_eval, y_pred_eval, zero_division=0)
+        f1   = f1_score(y_eval, y_pred_eval, zero_division=0)
+        auc  = roc_auc_score(y_eval, proba_eval)
+
         c1, c2, c3, c4, c5 = st.columns(5)
-        for c, v, n in zip([c1,c2,c3,c4,c5],[acc,prec,rec,f1,auc],["Accuracy","Precision","Recall","F1","ROC-AUC"]):
-            c.metric(n, f"{v:.3f}")
+        c1.metric("Accuracy", f"{acc:.3f}")
+        c2.metric("Precision", f"{prec:.3f}")
+        c3.metric("Recall", f"{rec:.3f}")
+        c4.metric("F1-score", f"{f1:.3f}")
+        c5.metric("ROC-AUC", f"{auc:.3f}")
+
         with st.expander("Confusion Matrix"):
             st.write(pd.DataFrame(confusion_matrix(y_eval, y_pred_eval),
                                   index=["Actual 0 (non-diabetic)", "Actual 1 (diabetic)"],
-                                  columns=["Pred 0","Pred 1"]))
+                                  columns=["Pred 0", "Pred 1"]))
     except Exception as e:
-        st.warning(f"Evaluation skipped: {e}")
-    if st.button("💾 Save threshold"):
-        joblib.dump(float(new_thr), "decision_threshold.pkl")
-        st.success(f"Saved new threshold {new_thr:.3f} — reload app to use.")
+        st.warning(f"Could not evaluate on collected data: {e}")
+
+    if st.button("💾 Save this threshold"):
+        try:
+            joblib.dump(float(new_thr), "decision_threshold.pkl")
+            st.success(f"Saved threshold = {new_thr:.3f}. Reload the app to use it.")
+        except Exception as e:
+            st.error(f"Failed to save threshold: {e}")
 
 def page_data_logs():
     st.markdown("## 📜 Data & Logs — Twin Memory")
     st.caption("Live predictions are appended to `live_predictions_log.csv` as the stream progresses.")
+
+    # In-session log
     st.markdown("### In-session Log (latest 200)")
     if st.session_state.log_df.empty:
         st.info("No log yet in this session.")
     else:
         st.dataframe(st.session_state.log_df.sort_values("shown_ts").tail(200), use_container_width=True, hide_index=True)
+
+    # On-disk log
     st.markdown("### On-Disk Log")
     if os.path.exists("live_predictions_log.csv"):
         try:
@@ -346,6 +535,8 @@ def page_data_logs():
             st.warning(f"Could not read on-disk log: {e}")
     else:
         st.info("`live_predictions_log.csv` not found yet. Start streaming to create it.")
+
+    # Clear disk log
     if st.button("🗑️ Clear on-disk log"):
         try:
             if os.path.exists("live_predictions_log.csv"):
@@ -358,17 +549,30 @@ def page_data_logs():
 def main():
     st.title("🩺 Digital Twin Framework — Real-Time Diabetes Management")
     st.caption("Prototype for educational decision support — not for medical use.")
+
     ensure_session()
+
+    # Load artifacts and data
     try:
         model, feature_cols, threshold = load_model_artifacts()
     except Exception as e:
-        st.error(f"Error loading model artifacts: {e}"); st.stop()
+        st.error(f"Error loading model artifacts: {e}")
+        st.stop()
+
     try:
         df = load_collected()
     except Exception as e:
-        st.error(f"Error loading collected data: {e}"); st.stop()
+        st.error(f"Error loading collected data: {e}")
+        st.stop()
+
+    # Sidebar navigation
     st.sidebar.markdown("## Navigation")
-    page = st.sidebar.radio("Go to", ["All Patients", "Patient Twin", "Model & Threshold", "Data & Logs"], index=0)
+    page = st.sidebar.radio(
+        "Go to",
+        ["All Patients", "Patient Twin", "Model & Threshold", "Data & Logs"],
+        index=0
+    )
+
     if page == "All Patients":
         page_all_patients(df, model, feature_cols, threshold)
     elif page == "Patient Twin":
@@ -380,3 +584,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
