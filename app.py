@@ -76,9 +76,12 @@ def compute_kpis(g: pd.DataFrame, threshold: float):
     tir = None
     if not g.empty:
         tir = float((g["blood_glucose_level"] < 180).mean() * 100.0)
-    alerts = int((g.get("proba", pd.Series([])) >= threshold).sum()) if "proba" in g else 0
+
+    proba_series = g["proba"] if "proba" in g else pd.Series(dtype=float)
+    alerts = int((proba_series >= threshold).sum())
+
     mean_glucose = float(g["blood_glucose_level"].mean()) if not g.empty else np.nan
-    max_prob = float(g.get("proba", pd.Series([0.0])).max()) if "proba" in g else np.nan
+    max_prob = float(proba_series.max()) if not proba_series.empty else np.nan
     return tir, alerts, mean_glucose, max_prob
 
 def ensure_session():
