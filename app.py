@@ -1,21 +1,36 @@
  (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/app.py b/app.py
-index 1bf0ef286981ba4b9f190ca7142774ffc2709f83..febf3ade0e8e78c1881509bbe466fc55400ba761 100644
+index 1bf0ef286981ba4b9f190ca7142774ffc2709f83..b1f198efa77a3cac5c0d4cdfb88b902b398979d4 100644
 --- a/app.py
 +++ b/app.py
-@@ -1,40 +1,42 @@
- # -*- coding: utf-8 -*-
- # app.py — Digital Twin Framework for Real-Time Diabetes Management
- # -------------------------------------------------------
- # Files expected in the same folder:
- #  - best_model.pkl
- #  - feature_cols.pkl
- #  - decision_threshold.pkl
- #  - Collected_cleaned.csv
- #
- # Run:
- #   pip install streamlit pandas plotly scikit-learn xgboost joblib
- #   streamlit run app.py
+@@ -1,40 +1,45 @@
+-# -*- coding: utf-8 -*-
+-# app.py — Digital Twin Framework for Real-Time Diabetes Management
+-# -------------------------------------------------------
+-# Files expected in the same folder:
+-#  - best_model.pkl
+-#  - feature_cols.pkl
+-#  - decision_threshold.pkl
+-#  - Collected_cleaned.csv
+-#
+-# Run:
+-#   pip install streamlit pandas plotly scikit-learn xgboost joblib
+-#   streamlit run app.py
++"""Streamlit application for the Digital Twin diabetes management demo.
++
++The repository bundles the model artifacts (``best_model.pkl`` and feature
++columns), a tuned classification threshold, and a cleaned historical dataset.
++
++Typical usage::
++
++    pip install -r requirements.txt
++    streamlit run app.py
++
++This module intentionally keeps module level statements unindented so that
++copy-pasting the file into environments such as the GitHub editor does not
++introduce accidental leading whitespace that could trigger ``IndentationError``
++on load.
++"""
  
  import os
  import time
@@ -46,7 +61,7 @@ index 1bf0ef286981ba4b9f190ca7142774ffc2709f83..febf3ade0e8e78c1881509bbe466fc55
  def load_model_artifacts():
      model = joblib.load("best_model.pkl")
      feature_cols = joblib.load("feature_cols.pkl")
-@@ -54,53 +56,56 @@ def load_collected() -> pd.DataFrame:
+@@ -54,53 +59,56 @@ def load_collected() -> pd.DataFrame:
      df["shifted_ts"] = df["timestamp"] + delta_to_today
      if "patient_id" not in df.columns:
          raise ValueError("Collected_cleaned.csv must contain 'patient_id'.")
@@ -105,7 +120,7 @@ index 1bf0ef286981ba4b9f190ca7142774ffc2709f83..febf3ade0e8e78c1881509bbe466fc55
      df_new.to_csv(path, mode="a", header=header, index=False)
  
  def advance_one_tick(pid: str, df: pd.DataFrame, model, feature_cols, threshold: float):
-@@ -144,90 +149,107 @@ def clock_panel(selected_pid: str | None, df: pd.DataFrame, title: str = "⏱️
+@@ -144,90 +152,107 @@ def clock_panel(selected_pid: str | None, df: pd.DataFrame, title: str = "⏱️
      c1.metric("System Clock (local)", system_now.strftime("%Y-%m-%d %H:%M:%S"))
      sim_label = "—"
      if selected_pid is not None:
@@ -218,7 +233,7 @@ index 1bf0ef286981ba4b9f190ca7142774ffc2709f83..febf3ade0e8e78c1881509bbe466fc55
      return fut
  
  # ---------- VISUALS ----------
-@@ -385,57 +407,99 @@ def page_patient_twin(df, model, feature_cols, threshold):
+@@ -385,57 +410,99 @@ def page_patient_twin(df, model, feature_cols, threshold):
      if g.empty:
          st.info("No events yet. Start streaming.")
      else:
