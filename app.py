@@ -7,6 +7,8 @@ import joblib
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+from datetime import datetime as _dt
+from zoneinfo import ZoneInfo  # UK time support
 
 import streamlit as st
 import plotly.express as px
@@ -27,6 +29,31 @@ except Exception:
 st.set_page_config(page_title="Digital Twin: Real-Time Diabetes Management",
                    page_icon="🩺", layout="wide")
 
+# ---------- TIME HELPERS (UK) ----------
+UK_TZ = ZoneInfo("Europe/London")
+
+def now_uk():
+    """Timezone-aware UK 'now'."""
+    return _dt.now(UK_TZ)
+
+def today_uk_midnight():
+    """UK midnight (today) as timezone-aware datetime."""
+    n = now_uk()
+    return _dt(n.year, n.month, n.day, 0, 0, 0, tzinfo=UK_TZ)
+
+def fmt_uk(dt_like):
+    """Format datetime (aware or naive) in UK local string for display."""
+    if isinstance(dt_like, pd.Timestamp):
+        if dt_like.tzinfo is None:
+            # treat as UK local naive
+            return dt_like.strftime("%Y-%m-%d %H:%M:%S")
+        return dt_like.tz_convert(UK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(dt_like, _dt):
+        if dt_like.tzinfo is None:
+            return dt_like.strftime("%Y-%m-%d %H:%M:%S")
+        return dt_like.astimezone(UK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return str(dt_like)
+
 # ---------- LOADERS ----------
 @st.cache_resource
 def load_model_artifacts():
@@ -43,13 +70,16 @@ def load_collected() -> pd.DataFrame:
     if "blood_glucose_level" not in df or "HbA1c_level" not in df:
         raise ValueError("CSV must contain 'blood_glucose_level' and 'HbA1c_level'.")
 
+    # Parse original timestamps as naive (assumed local/original)
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
-    # shift entire dataset to start today (fake live)
+    # Shift entire dataset so its first day aligns with *UK today* (fake live)
     start_hist = df["timestamp"].dt.normalize().min()
-    today = pd.Timestamp.now().normalize()
-    delta = today - start_hist
-    df["shifted_ts"] = df["timestamp"] + delta
+    uk_today_midnight = pd.Timestamp(today_uk_midnight())
+    # Drop tz for arithmetic while keeping UK wall clock
+    uk_today_midnight_naive = uk_today_midnight.tz_localize(None)
+    delta = uk_today_midnight_naive - start_hist
+    df["shifted_ts"] = df["timestamp"] + delta  # still naive, but UK-aligned
 
     return df.sort_values(["patient_id", "shifted_ts"]).reset_index(drop=True)
 
@@ -113,7 +143,7 @@ def advance_one_tick(pid: str, df: pd.DataFrame, model, feature_cols, threshold:
         "patient_id": row["patient_id"],
         "historical_ts": row["timestamp"],
         "shifted_ts": row["shifted_ts"],
-        "arrival_ts": pd.Timestamp.now(),
+        "arrival_ts": pd.Timestamp(now_uk()),  # UK time in log
         "shown_ts": row["shifted_ts"],
         "blood_glucose_level": float(row["blood_glucose_level"]),
         "HbA1c_level": float(row["HbA1c_level"]),
@@ -147,24 +177,24 @@ def autoplay_tick(pid, df, model, feature_cols, threshold, interval_sec: float):
 def clock_panel(selected_pid: str | None, df: pd.DataFrame, title: str = "⏱️ Live vs Simulated Time"):
     st.markdown(f"### {title}")
     c1, c2 = st.columns(2)
-    c1.metric("System Clock (local)", pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"))
+    c1.metric("System Clock (UK)", fmt_uk(now_uk()))
 
     sim_label = "—"
     if selected_pid is not None:
         log = st.session_state.log_df
         g_log = log[log["patient_id"].astype(str) == str(selected_pid)].sort_values("shown_ts")
         if not g_log.empty:
-            sim_label = pd.to_datetime(g_log.iloc[-1]["shown_ts"]).strftime("%Y-%m-%d %H:%M:%S")
+            sim_label = fmt_uk(pd.to_datetime(g_log.iloc[-1]["shown_ts"]))
         else:
             g_src = df[df["patient_id"].astype(str) == str(selected_pid)].sort_values("shifted_ts")
             i = st.session_state.stream_index.get(selected_pid, 0)
             if not g_src.empty:
                 if i < len(g_src):
-                    sim_label = pd.to_datetime(g_src.iloc[i]["shifted_ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                    sim_label = fmt_uk(pd.to_datetime(g_src.iloc[i]["shifted_ts"]))
                 else:
-                    sim_label = pd.to_datetime(g_src.iloc[-1]["shifted_ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                    sim_label = fmt_uk(pd.to_datetime(g_src.iloc[-1]["shifted_ts"]))
     c2.metric(f"Simulated Time — Patient {selected_pid if selected_pid else ''}", sim_label)
-    st.caption("System = real time • Simulated = dataset time being replayed.")
+    st.caption("System = UK local time • Simulated = dataset time being replayed (shifted to UK today).")
 
 # ---------- FORECAST HELPERS ----------
 def build_patient_series(df: pd.DataFrame, pid: str) -> pd.DataFrame:
@@ -385,7 +415,11 @@ def page_patient_twin(df, model, feature_cols, threshold):
         st.info("No events yet. Start streaming.")
     else:
         show = g[["shown_ts","blood_glucose_level","HbA1c_level","status","advice","proba"]].tail(10)
-        show = show.rename(columns={"shown_ts":"time","blood_glucose_level":"glucose","HbA1c_level":"hba1c"})
+        show = show.rename(columns={
+            "shown_ts":"time",
+            "blood_glucose_level":"glucose",
+            "HbA1c_level":"hba1c"
+        })
         st.dataframe(show, use_container_width=True, hide_index=True)
 
     # ---------- 🔮 FUTURE SIMULATOR ----------
@@ -403,9 +437,15 @@ def page_patient_twin(df, model, feature_cols, threshold):
 
     anchor_time = None
     if start_choice == "System now":
-        anchor_time = pd.Timestamp.now().floor("min")
+        # Use UK wall time (drop tz to match naive series)
+        anchor_time = pd.Timestamp(now_uk()).floor("min").tz_localize(None)
     elif start_choice == "Custom…":
-        anchor_time = pd.Timestamp(st.datetime_input("Pick start time", value=pd.Timestamp.now().floor("min"), key="fc_dt"))
+        # Fallback for older Streamlit: date + time inputs
+        d_default = now_uk().date()
+        t_default = now_uk().replace(second=0, microsecond=0).time()
+        d = st.date_input("Pick start date (UK)", value=d_default, key="fc_date")
+        t = st.time_input("Pick start time (UK)", value=t_default, key="fc_time")
+        anchor_time = pd.Timestamp(_dt.combine(d, t))
 
     if st.button("Generate forecast"):
         fut = simulate_future(pid, df, model, feature_cols, threshold,
