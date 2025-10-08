@@ -402,12 +402,10 @@ def page_patient_twin(df, model, feature_cols, threshold):
     ], index=0)
 
     anchor_time = None
-if start_choice == "System now":
-    anchor_time = pd.Timestamp.now().floor("min")
-elif start_choice == "Custom…":
-    anchor_time = pd.Timestamp(st.datetime_input("Pick start time", value=pd.Timestamp.now().floor("min"), key="fc_dt"))
-
-
+    if start_choice == "System now":
+        anchor_time = pd.Timestamp.now().floor("min")
+    elif start_choice == "Custom…":
+        anchor_time = pd.Timestamp(st.datetime_input("Pick start time", value=pd.Timestamp.now().floor("min"), key="fc_dt"))
 
     if st.button("Generate forecast"):
         fut = simulate_future(pid, df, model, feature_cols, threshold,
